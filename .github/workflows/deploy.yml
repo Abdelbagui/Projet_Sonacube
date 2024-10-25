@@ -1,0 +1,111 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy_k8s:
+    runs-on: ubuntu-latest
+
+    outputs:
+      sonarqube_ip: ${{ steps.get_sonarqube_ip.outputs.sonarqube_ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext jq ansible unzip
+          ansible-galaxy collection install kubernetes.core
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v1
+        with:
+          version: 'latest'
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 'latest'
+
+      - name: Initialize Terraform
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -backend-config="client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var="appId=${{ secrets.AZURE_CLIENT_ID }}" \
+            -var="password=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -var="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve \
+            -var="appId=${{ secrets.AZURE_CLIENT_ID }}" \
+            -var="password=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -var="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      # - name: Configure kubectl
+      #   run: |
+      #     az aks get-credentials --resource-group ${{ secrets.RESOURCE_GROUP }} --name ${{ secrets.AKS_CLUSTER_NAME }}
+
+      # - name: Deploy SonarQube on AKS
+      #   run: |
+      #     kubectl apply -f k8s/sonarqube-deployment.yaml
+      #     kubectl apply -f k8s/sonarqube-service.yaml
+
+      - name: Get SonarQube External IP
+        id: get_sonarqube_ip
+        run: |
+          # Boucle jusqu'à ce que l'IP soit disponible
+          for i in {1..20}; do
+            IP=$(kubectl get svc sonarqube -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then
+              echo "SonarQube IP found: $IP"
+              echo "::set-output name=sonarqube_ip::$IP"
+              break
+            fi
+            echo "Waiting for SonarQube IP..."
+            sleep 15
+          done
+
+  analyze_code:
+    needs: deploy_k8s
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up JDK
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Run SonarQube Scanner
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          curl -sSLo sonar-scanner-cli.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.6.2.2472-linux.zip
+          unzip sonar-scanner-cli.zip
+          ./sonar-scanner-*/bin/sonar-scanner \
+            -Dsonar.projectKey=MaSociete.MonApplication \
+            -Dsonar.projectName="Mon Application" \
+            -Dsonar.projectVersion="1.0" \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=http://${{ needs.deploy_k8s.outputs.sonarqube_ip }}:9000 \
+            -Dsonar.login=$SONAR_TOKEN
